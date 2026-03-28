@@ -16,6 +16,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 
+import heademotions
 # Hardware / Display Imports
 import board
 import busio
@@ -40,14 +41,17 @@ except ImportError:
 SCREEN_WIDTH = 128
 SCREEN_HEIGHT = 160
 EYE_COLOR = (255, 255, 255) # White
-BG_COLOR = (0, 0, 0)       # Black
-EYE_SIZE = 120              # Base size
+BG_COLOR = (0, 0, 0)      # Black
+EYE_SIZE = 96            # Base size (smaller eyes)
 FLOOR_Y = SCREEN_HEIGHT - 5
 
 # Camera / Face Tracking Config
 FACE_MODEL_PATH = "face_detection_yunet_2023mar.onnx"
-# We'll capture at low res for faster processing
-CAMERA_RES = (320, 240)
+# Use a larger 16:9 main stream for wider/detail-rich source frames (wider field of view)
+CAMERA_MAIN_RES = (1920, 1080)
+# Balanced 16:9 processing for detail + CPU headroom (better for emotion models)
+CAMERA_RES = (1280, 720)
+STREAM_RES = (320, 180)   # Downscaled for web preview (maintain 16:9, no lag)
 CONFIDENCE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3
 # Camera adjustments
@@ -56,25 +60,33 @@ CAMERA_ROTATE_180 = True
 STREAM_SWAP_RB = True
 
 # Eye Interaction Config
-MAX_X_OFFSET = 50
-MAX_Y_OFFSET = 35
+MAX_X_OFFSET = 30
+MAX_Y_OFFSET = 22
 FACE_ROLL_MULT = 0.75
 FACE_ROLL_MAX_DEG = 10.0
+EYE_BOUND_MARGIN = 8
 
 # Blink Speed (Higher = Faster)
-BLINK_SPEED_MIN = 3.5
-BLINK_SPEED_MAX = 5.0
+BLINK_SPEED_MIN = 2.4
+BLINK_SPEED_MAX = 3.2
+
+# Far-face squint behavior
+FAR_FACE_AREA_RATIO = 0.018
+FAR_SQUINT_CHANCE = 0.08
+FAR_SQUINT_MIN_SEC = 0.22
+FAR_SQUINT_MAX_SEC = 0.55
 
 # --- Emotion Presets ---
 EMOTION_PRESETS = {
-    "idle":       {"scale_w": 1.0, "scale_h": 1.0,  "top_lid": 0.0,  "bottom_lid": 0.0,  "lid_angle":   0.0, "mirror_angle": True},
-    "happy":      {"scale_w": 1.2, "scale_h": 0.65, "top_lid": 0.0,  "bottom_lid": 0.55, "lid_angle": -12.0, "mirror_angle": True},
-    "sad":        {"scale_w": 1.1, "scale_h": 1.1,  "top_lid": 0.35, "bottom_lid": 0.0,  "lid_angle":  15.0, "mirror_angle": True},
-    "angry":      {"scale_w": 1.0, "scale_h": 0.9,  "top_lid": 0.35, "bottom_lid": 0.0,  "lid_angle": -20.0, "mirror_angle": True},
-    "surprised":  {"scale_w": 0.9, "scale_h": 1.3,  "top_lid": 0.0,  "bottom_lid": 0.0,  "lid_angle":   0.0, "mirror_angle": True},
-    "suspicious": {"scale_w": 1.1, "scale_h": 0.6,  "top_lid": 0.4,  "bottom_lid": 0.4,  "lid_angle":   0.0, "mirror_angle": True},
-    "sleepy":     {"scale_w": 1.1, "scale_h": 1.0,  "top_lid": 0.6,  "bottom_lid": 0.0,  "lid_angle":   0.0, "mirror_angle": True},
-    "looking":    {"scale_w": 1.0, "scale_h": 0.9,  "top_lid": 0.25, "bottom_lid": 0.0,  "lid_angle":  -8.0, "mirror_angle": False},
+    "idle": {"scale_w": 1.0, "scale_h": 1.0, "top_lid": 0.0, "bottom_lid": 0.0, "lid_angle": 0.0, "mirror_angle": True},
+    "happy": {"scale_w": 1.2, "scale_h": 0.65, "top_lid": 0.0, "bottom_lid": 0.55, "lid_angle": -12.0, "mirror_angle": True},
+    "sad": {"scale_w": 1.1, "scale_h": 1.1, "top_lid": 0.35, "bottom_lid": 0.0, "lid_angle": 15.0, "mirror_angle": True},
+    "angry": {"scale_w": 1.0, "scale_h": 0.9, "top_lid": 0.35, "bottom_lid": 0.0, "lid_angle": -20.0, "mirror_angle": True},
+    "surprised": {"scale_w": 0.9, "scale_h": 1.3, "top_lid": 0.0, "bottom_lid": 0.0, "lid_angle": 0.0, "mirror_angle": True},
+    "suspicious": {"scale_w": 1.1, "scale_h": 0.6, "top_lid": 0.4, "bottom_lid": 0.4, "lid_angle": 0.0, "mirror_angle": True},
+    "sleepy": {"scale_w": 1.1, "scale_h": 1.0, "top_lid": 0.6, "bottom_lid": 0.0, "lid_angle": 0.0, "mirror_angle": True},
+    "looking": {"scale_w": 1.0, "scale_h": 0.9, "top_lid": 0.25, "bottom_lid": 0.0, "lid_angle": -8.0, "mirror_angle": False},
+    "squint": {"scale_w": 1.0, "scale_h": 0.62, "top_lid": 0.42, "bottom_lid": 0.35, "lid_angle": 0.0, "mirror_angle": True},
 }
 
 SPECIAL_EMOTIONS = ["happy", "suspicious", "sleepy"]
@@ -83,8 +95,10 @@ SPECIAL_EMOTIONS = ["happy", "suspicious", "sleepy"]
 STREAM_ENABLED = True
 STREAM_HOST = "0.0.0.0"
 STREAM_PORT = 8080
-STREAM_FPS = 12
-STREAM_JPEG_QUALITY = 80
+STREAM_FPS = 8
+STREAM_JPEG_QUALITY = 70
+RENDER_FPS = 24
+VISION_FPS = 10
 
 
 # --- BlockyEye Class (PIL Version with emotion controls) ---
@@ -163,15 +177,15 @@ class BlockyEye:
         idle = EMOTION_PRESETS["idle"]
 
         intensity = max(0.0, min(1.0, intensity))
-        scale_w    = idle["scale_w"]    + (preset["scale_w"]    - idle["scale_w"])    * intensity
-        scale_h    = idle["scale_h"]    + (preset["scale_h"]    - idle["scale_h"])    * intensity
-        top_lid    = idle["top_lid"]    + (preset["top_lid"]    - idle["top_lid"])    * intensity
+        scale_w = idle["scale_w"] + (preset["scale_w"] - idle["scale_w"]) * intensity
+        scale_h = idle["scale_h"] + (preset["scale_h"] - idle["scale_h"]) * intensity
+        top_lid = idle["top_lid"] + (preset["top_lid"] - idle["top_lid"]) * intensity
         bottom_lid = idle["bottom_lid"] + (preset["bottom_lid"] - idle["bottom_lid"]) * intensity
-        lid_angle  = idle["lid_angle"]  + (preset["lid_angle"]  - idle["lid_angle"])  * intensity
+        lid_angle = idle["lid_angle"] + (preset["lid_angle"] - idle["lid_angle"]) * intensity
 
-        self.target_scale_w    = scale_w
-        self.target_scale_h    = scale_h
-        self.target_top_lid    = top_lid
+        self.target_scale_w = scale_w
+        self.target_scale_h = scale_h
+        self.target_top_lid = top_lid
         self.target_bottom_lid = bottom_lid
 
         if preset.get("mirror_angle", True) and not self.is_left and abs(lid_angle) > 0:
@@ -190,9 +204,9 @@ class BlockyEye:
             burst_active = time.time() < self.happy_burst_until
             if burst_active:
                 target_y_phys -= 12.0
-                self.target_top_lid    = max(self.target_top_lid,    0.95)
+                self.target_top_lid = max(self.target_top_lid, 0.95)
                 self.target_bottom_lid = max(self.target_bottom_lid, 0.95)
-                self.target_lid_angle  = 0.0
+                self.target_lid_angle = 0.0
 
             if self.current_emotion == "happy":
                 ht = time.time() * 6.0 + self.happy_phase
@@ -232,18 +246,18 @@ class BlockyEye:
 
             k = 0.22
             d = 0.55
-            self.scale_w_vel   = (self.scale_w_vel   + (self.target_scale_w   - self.scale_w)   * k) * d
-            self.scale_h_vel   = (self.scale_h_vel   + (self.target_scale_h   - self.scale_h)   * k) * d
-            self.scale_w      += self.scale_w_vel
-            self.scale_h      += self.scale_h_vel
+            self.scale_w_vel = (self.scale_w_vel + (self.target_scale_w - self.scale_w) * k) * d
+            self.scale_h_vel = (self.scale_h_vel + (self.target_scale_h - self.scale_h) * k) * d
+            self.scale_w += self.scale_w_vel
+            self.scale_h += self.scale_h_vel
 
-            self.top_lid_vel    = (self.top_lid_vel    + (self.target_top_lid    - self.top_lid)    * k) * d
+            self.top_lid_vel = (self.top_lid_vel + (self.target_top_lid - self.top_lid) * k) * d
             self.bottom_lid_vel = (self.bottom_lid_vel + (self.target_bottom_lid - self.bottom_lid) * k) * d
-            self.lid_angle_vel  = (self.lid_angle_vel  + (self.target_lid_angle  - self.lid_angle)  * k) * d
+            self.lid_angle_vel = (self.lid_angle_vel + (self.target_lid_angle - self.lid_angle) * k) * d
 
-            self.top_lid    += self.top_lid_vel
+            self.top_lid += self.top_lid_vel
             self.bottom_lid += self.bottom_lid_vel
-            self.lid_angle  += self.lid_angle_vel
+            self.lid_angle += self.lid_angle_vel
 
             self.target_w = (self.base_w * self.scale_w) + breath_w + (move_stretch_x * 0.5)
             self.target_h = (self.base_h * self.scale_h) + breath_h - (move_stretch_y * 0.2)
@@ -263,7 +277,7 @@ class BlockyEye:
 
         elif self.blink_state == "SQUASHING":
             squeeze_speed = 65 * self.blink_speed_mult
-            spread_speed  = 40 * self.blink_speed_mult
+            spread_speed = 40 * self.blink_speed_mult
             self.current_h -= squeeze_speed
             self.current_w += spread_speed
             self.current_pos[1] = FLOOR_Y - self.current_h // 2
@@ -308,9 +322,9 @@ class BlockyEye:
         self.w = self.current_w
         self.h = self.current_h
 
-    def draw_radial_rect(self, draw, x, y, w, h, color, radius, pupil_offset=(0, 0)):
-        center_x = x + w / 2
-        center_y = y + h / 2
+    def draw_radial_rect(self, draw, x, y, w, h, color, radius, pupil_offset=(0,0)):
+        center_x = x + w/2
+        center_y = y + h/2
         steps = 4
         for i in range(steps):
             size_factor = 1.0 - (i / steps)
@@ -319,11 +333,7 @@ class BlockyEye:
             if current_w <= 0 or current_h <= 0:
                 continue
             b_factor = 0.85 + 0.15 * (i / steps)
-            cur_color = (
-                int(color[0] * b_factor),
-                int(color[1] * b_factor),
-                int(color[2] * b_factor),
-            )
+            cur_color = (int(color[0] * b_factor), int(color[1] * b_factor), int(color[2] * b_factor))
             shift_x = pupil_offset[0] * (1.0 - size_factor) * 15
             shift_y = pupil_offset[1] * (1.0 - size_factor) * 15
             cx = center_x + shift_x
@@ -346,7 +356,7 @@ class BlockyEye:
             lid_h = int(h * self.top_lid)
             lid_src = Image.new("RGBA", (int(w + 20), int(lid_h + 20)), (*lid_color, 255))
             if abs(self.lid_angle) > 0.1:
-                lid_src = lid_src.rotate(self.lid_angle, resample=Image.BICUBIC, expand=True)
+                lid_src = lid_src.rotate(self.lid_angle, resample=Image.BILINEAR, expand=True)
             lid_x = int(x0 + w / 2 - lid_src.width / 2)
             lid_y = int(y0 - 10)
             eye_img.alpha_composite(lid_src, (lid_x, lid_y))
@@ -355,7 +365,7 @@ class BlockyEye:
             lid_h = int(h * self.bottom_lid)
             lid_src = Image.new("RGBA", (int(w + 20), int(lid_h + 20)), (*lid_color, 255))
             if abs(self.lid_angle) > 0.1:
-                lid_src = lid_src.rotate(self.lid_angle, resample=Image.BICUBIC, expand=True)
+                lid_src = lid_src.rotate(self.lid_angle, resample=Image.BILINEAR, expand=True)
             lid_x = int(x0 + w / 2 - lid_src.width / 2)
             lid_y = int(y1 + 10 - lid_src.height)
             eye_img.alpha_composite(lid_src, (lid_x, lid_y))
@@ -364,11 +374,11 @@ class BlockyEye:
         draw_w = max(4, int(self.w))
         draw_h = max(4, int(self.h))
 
-        eye_img_size = int(max(self.base_w, self.base_h) * 2.5)
+        eye_img_size = int(max(self.base_w, self.base_h) * 2.1)
         eye_img = Image.new("RGBA", (eye_img_size, eye_img_size), (0, 0, 0, 0))
         eye_draw = ImageDraw.Draw(eye_img)
 
-        base_radius   = int(min(self.base_w, self.base_h) * 0.25)
+        base_radius = int(min(self.base_w, self.base_h) * 0.25)
         corner_radius = min(base_radius, int(min(draw_w, draw_h) / 2))
         off_x = max(-1, min(1, (self.current_pos[0] - self.base_x) / 30.0))
         off_y = max(-1, min(1, (self.current_pos[1] - self.base_y) / 20.0))
@@ -382,7 +392,7 @@ class BlockyEye:
         self.draw_radial_rect(eye_draw, x0, y0, draw_w, draw_h, EYE_COLOR, corner_radius, (off_x, off_y))
         self.draw_eyelids(eye_img, (x0, y0, x1, y1))
 
-        rotated = eye_img.rotate(self.current_rotation, resample=Image.BICUBIC, expand=False)
+        rotated = eye_img.rotate(self.current_rotation, resample=Image.BILINEAR, expand=False)
 
         paste_x = int(self.current_pos[0] - eye_img_size / 2)
         paste_y = int(self.current_pos[1] - eye_img_size / 2)
@@ -421,6 +431,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
                     continue
 
+                # Encode to JPEG (frame is RGB)
                 img = Image.fromarray(frame)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=STREAM_JPEG_QUALITY)
@@ -456,13 +467,13 @@ disp_r = None
 try:
     spi0 = board.SPI()
     disp_l = st7735.ST7735R(
-        spi0,
-        rotation=0,
-        baudrate=24000000,
+        spi0, 
+        rotation=0, 
+        baudrate=24000000, 
         bgr=True,
-        cs=digitalio.DigitalInOut(board.CE1),
-        dc=digitalio.DigitalInOut(board.D24),
-        rst=digitalio.DigitalInOut(board.D25),
+        cs=digitalio.DigitalInOut(board.CE1),   
+        dc=digitalio.DigitalInOut(board.D24),   
+        rst=digitalio.DigitalInOut(board.D25)
     )
 except Exception as e:
     print(f"Error init Left Display (SPI0): {e}")
@@ -471,13 +482,13 @@ except Exception as e:
 try:
     spi1 = busio.SPI(clock=board.D21, MOSI=board.D20, MISO=board.D19)
     disp_r = st7735.ST7735R(
-        spi1,
-        rotation=0,
-        baudrate=24000000,
+        spi1, 
+        rotation=0, 
+        baudrate=24000000, 
         bgr=True,
-        cs=digitalio.DigitalInOut(board.D18),
-        dc=digitalio.DigitalInOut(board.D23),
-        rst=digitalio.DigitalInOut(board.D27),
+        cs=digitalio.DigitalInOut(board.D18),   
+        dc=digitalio.DigitalInOut(board.D23),   
+        rst=digitalio.DigitalInOut(board.D27)
     )
 except Exception as e:
     print(f"Error init Right Display (SPI1): {e}")
@@ -488,12 +499,18 @@ print("Initializing Picamera2...")
 picam2 = None
 try:
     picam2 = Picamera2()
+    
+    # Pi Camera v2: Full sensor resolution (3280x2464) for widest FOV
+    # Using full sensor ensures no digital zoom, maximizing field of view
     config = picam2.create_video_configuration(
-        main={"format": "RGB888", "size": CAMERA_RES}
+        main={"format": 'RGB888', "size": CAMERA_MAIN_RES},
+        raw={"size": (3280, 2464)}
     )
     picam2.configure(config)
+    # Force full sensor area (no cropping)
+    picam2.set_controls({"ScalerCrop": (0, 0, 3280, 2464)})
     picam2.start()
-    print(f"Camera started: {CAMERA_RES}")
+    print(f"Camera started: Full sensor (3280x2464) -> Main ({CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}), detect ({CAMERA_RES[0]}x{CAMERA_RES[1]})")
 except Exception as e:
     print(f"Error starting Picamera2: {e}")
     sys.exit(1)
@@ -503,7 +520,7 @@ try:
     if not Path(FACE_MODEL_PATH).exists():
         print(f"Error: Face model not found at {FACE_MODEL_PATH}")
         sys.exit(1)
-
+        
     detector = cv2.FaceDetectorYN.create(
         model=FACE_MODEL_PATH,
         config="",
@@ -512,7 +529,7 @@ try:
         nms_threshold=NMS_THRESHOLD,
         top_k=5000,
         backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
-        target_id=cv2.dnn.DNN_TARGET_CPU,
+        target_id=cv2.dnn.DNN_TARGET_CPU
     )
     print("YuNet initialized.")
 except Exception as e:
@@ -532,187 +549,287 @@ if STREAM_ENABLED:
 center_x = SCREEN_WIDTH / 2
 center_y = SCREEN_HEIGHT / 2
 
-left_eye  = BlockyEye(center_x, center_y, scale=1.0, is_left=True)
+left_eye = BlockyEye(center_x, center_y, scale=1.0, is_left=True)
 right_eye = BlockyEye(center_x, center_y, scale=1.0, is_left=False)
-left_eye.set_emotion("idle",  0.45)
+# Keep both eyes using identical dynamics to avoid drift during blink phases.
+right_eye.noise_t = left_eye.noise_t
+right_eye.rot_sensitivity = left_eye.rot_sensitivity
+right_eye.rot_speed = left_eye.rot_speed
+right_eye.happy_phase = left_eye.happy_phase
+left_eye.set_emotion("idle", 0.45)
 right_eye.set_emotion("idle", 0.45)
 
-# Animation Loop State
-running          = True
-next_blink_time  = time.time() + random.uniform(3, 6)
-last_blink_time  = time.time()
-frame_skip_counter = 0
-last_face_time   = time.time()
-search_phase     = random.uniform(0.0, math.pi * 2)
-search_active_until = 0.0
-next_search_time = time.time() + random.uniform(6.0, 12.0)
-next_special_time = time.time() + random.uniform(12.0, 20.0)
-special_active_until = 0.0
-special_emotion  = None
-smoothed_x_off   = 0.0
-smoothed_y_off   = 0.0
+# Animation Loop Vars
+running = True
+next_blink_time = time.time() + random.uniform(3, 6)
+last_blink_time = time.time()
+smoothed_x_off = 0.0
+smoothed_y_off = 0.0
 smoothed_rotation = 0.0
-search_emotion_active = False
-search_style     = "plain"
+squint_active = False
+
+target_lock = threading.Lock()
+target_x_off = 0.0
+target_y_off = 0.0
+target_rotation = 0.0
+target_squint = 0.0
+squint_until = 0.0
+
+def clamp_eye_target(eye):
+    # Keep eye center inside the panel bounds even during shape changes.
+    half_w = max(12.0, eye.base_w * 0.42)
+    half_h = max(12.0, eye.base_h * 0.42)
+    min_x = half_w + EYE_BOUND_MARGIN
+    max_x = SCREEN_WIDTH - half_w - EYE_BOUND_MARGIN
+    min_y = half_h + EYE_BOUND_MARGIN
+    max_y = SCREEN_HEIGHT - half_h - EYE_BOUND_MARGIN
+    eye.target_pos[0] = max(min_x, min(max_x, eye.target_pos[0]))
+    eye.target_pos[1] = max(min_y, min(max_y, eye.target_pos[1]))
+
+
+def trigger_synced_blink(speed_mult):
+    # Align blink start conditions so both displays animate the same phase.
+    avg_y = (left_eye.current_pos[1] + right_eye.current_pos[1]) * 0.5
+    avg_w = (left_eye.current_w + right_eye.current_w) * 0.5
+    avg_h = (left_eye.current_h + right_eye.current_h) * 0.5
+    for eye in (left_eye, right_eye):
+        eye.blink_state = "IDLE"
+        eye.vy = 0
+        eye.current_pos[1] = avg_y
+        eye.current_w = avg_w
+        eye.current_h = avg_h
+        eye.w = avg_w
+        eye.h = avg_h
+    left_eye.start_blink(speed_mult)
+    right_eye.start_blink(speed_mult)
+
+
+def mirror_blink_state(master, slave):
+    # Force exact blink phase matching once a blink is active.
+    slave.blink_state = master.blink_state
+    slave.vy = master.vy
+    slave.current_pos[1] = master.current_pos[1]
+    slave.current_w = master.current_w
+    slave.current_h = master.current_h
+    slave.target_w = master.target_w
+    slave.target_h = master.target_h
+    slave.w = master.w
+    slave.h = master.h
+
+
+def mirror_full_state(master, slave):
+    # Keep both eyes identical by driving one master state.
+    slave.blink_state = master.blink_state
+    slave.vy = master.vy
+    slave.current_pos[0] = master.current_pos[0]
+    slave.current_pos[1] = master.current_pos[1]
+    slave.target_pos[0] = master.target_pos[0]
+    slave.target_pos[1] = master.target_pos[1]
+    slave.current_w = master.current_w
+    slave.current_h = master.current_h
+    slave.target_w = master.target_w
+    slave.target_h = master.target_h
+    slave.current_rotation = master.current_rotation
+    slave.target_rotation = master.target_rotation
+    slave.scale_w = master.scale_w
+    slave.scale_h = master.scale_h
+    slave.target_scale_w = master.target_scale_w
+    slave.target_scale_h = master.target_scale_h
+    slave.top_lid = master.top_lid
+    slave.bottom_lid = master.bottom_lid
+    slave.lid_angle = master.lid_angle
+    slave.target_top_lid = master.target_top_lid
+    slave.target_bottom_lid = master.target_bottom_lid
+    slave.target_lid_angle = master.target_lid_angle
+    slave.w = master.w
+    slave.h = master.h
+
+
+def vision_worker():
+    global running, target_x_off, target_y_off, target_rotation, target_squint, squint_until, latest_frame
+
+    interval = 1.0 / max(1.0, float(VISION_FPS))
+    next_tick = time.perf_counter()
+
+    while running:
+        try:
+            # Capture full frame and resize once for detector input
+            large_frame = picam2.capture_array()
+            frame = cv2.resize(large_frame, CAMERA_RES)
+
+            if CAMERA_ROTATE_180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+            local_x = 0.0
+            local_y = 0.0
+            local_rot = 0.0
+            local_squint = 0.0
+
+            if frame is not None and frame.size > 0:
+                stream_frame = None
+                if STREAM_ENABLED:
+                    stream_frame = cv2.resize(frame, STREAM_RES)
+                    if STREAM_SWAP_RB:
+                        stream_frame = cv2.cvtColor(stream_frame, cv2.COLOR_BGR2RGB)
+                    scale_x = STREAM_RES[0] / CAMERA_RES[0]
+                    scale_y = STREAM_RES[1] / CAMERA_RES[1]
+
+                detector.setInputSize((frame.shape[1], frame.shape[0]))
+                faces = detector.detect(frame)
+
+                if faces[1] is not None:
+                    detected_faces = faces[1]
+                    largest_face = max(detected_faces, key=lambda f: f[2] * f[3])
+
+                    fx, fy, fw, fh = largest_face[0:4]
+                    re_x, re_y = largest_face[4], largest_face[5]
+                    le_x, le_y = largest_face[6], largest_face[7]
+
+                    if STREAM_ENABLED and stream_frame is not None:
+                        fx_s, fy_s = int(fx * scale_x), int(fy * scale_y)
+                        fw_s, fh_s = int(fw * scale_x), int(fh * scale_y)
+                        re_x_s, re_y_s = int(re_x * scale_x), int(re_y * scale_y)
+                        le_x_s, le_y_s = int(le_x * scale_x), int(le_y * scale_y)
+                        cv2.rectangle(stream_frame, (fx_s, fy_s), (fx_s + fw_s, fy_s + fh_s), (0, 255, 0), 2)
+                        cv2.circle(stream_frame, (re_x_s, re_y_s), 5, (255, 0, 0), -1)
+                        cv2.circle(stream_frame, (le_x_s, le_y_s), 5, (255, 0, 0), -1)
+
+                    face_cx = (fx + fw / 2) / CAMERA_RES[0]
+                    face_cy = (fy + fh / 2) / CAMERA_RES[1]
+                    norm_x = -((face_cx - 0.5) * 2.0)
+                    norm_y = (face_cy - 0.5) * 2.0
+
+                    local_x = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, norm_x * MAX_X_OFFSET))
+                    local_y = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, norm_y * MAX_Y_OFFSET))
+
+                    # Randomly squint when the detected face is far away.
+                    face_area_ratio = (fw * fh) / float(CAMERA_RES[0] * CAMERA_RES[1])
+                    now = time.time()
+                    if face_area_ratio < FAR_FACE_AREA_RATIO:
+                        if now > squint_until and random.random() < FAR_SQUINT_CHANCE:
+                            squint_until = now + random.uniform(FAR_SQUINT_MIN_SEC, FAR_SQUINT_MAX_SEC)
+                        if now < squint_until:
+                            local_squint = 1.0
+                    else:
+                        squint_until = 0.0
+
+                    dx = re_x - le_x
+                    dy = re_y - le_y
+                    if dx != 0:
+                        angle_rad = math.atan2(dy, dx)
+                        angle_deg = math.degrees(angle_rad)
+                        local_rot = max(-FACE_ROLL_MAX_DEG, min(FACE_ROLL_MAX_DEG, -angle_deg * FACE_ROLL_MULT))
+                else:
+                    squint_until = 0.0
+
+                with target_lock:
+                    target_x_off = local_x
+                    target_y_off = local_y
+                    target_rotation = local_rot
+                    target_squint = local_squint
+
+                if faces[1] is not None:
+                    heademotions.feed_face(norm_x, norm_y)
+
+                if STREAM_ENABLED and stream_frame is not None:
+                    with frame_lock:
+                        latest_frame = stream_frame
+
+        except Exception as e:
+            print(f"Capture/Detect Error: {e}")
+
+        next_tick += interval
+        sleep_time = next_tick - time.perf_counter()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+            next_tick = time.perf_counter()
 
 print("Starting Tracking Loop...")
-time.sleep(1.0)  # Warmup
+time.sleep(1.0) # Warmup
+
+heademotions.start_head_tracking()
+
+vision_thread = threading.Thread(target=vision_worker, daemon=True)
+vision_thread.start()
 
 try:
     while running:
-        start_time = time.time()
+        loop_start = time.perf_counter()
 
-        target_x_off  = 0
-        target_y_off  = 0
-        target_rotation = 0.0
-
-        if frame_skip_counter % 2 == 0:
-            try:
-                frame = picam2.capture_array()
-
-                if CAMERA_ROTATE_180:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
-
-                if frame is not None and frame.size > 0:
-                    if STREAM_ENABLED:
-                        stream_frame = frame
-                        if STREAM_SWAP_RB:
-                            stream_frame = cv2.cvtColor(stream_frame, cv2.COLOR_BGR2RGB)
-                        with frame_lock:
-                            latest_frame = stream_frame
-
-                    detector.setInputSize((frame.shape[1], frame.shape[0]))
-                    faces = detector.detect(frame)
-
-                    if faces[1] is not None:
-                        detected_faces = faces[1]
-                        largest_face = max(detected_faces, key=lambda f: f[2] * f[3])
-
-                        fx, fy, fw, fh = largest_face[0:4]
-                        re_x, re_y = largest_face[4], largest_face[5]
-                        le_x, le_y = largest_face[6], largest_face[7]
-
-                        face_cx = (fx + fw / 2) / CAMERA_RES[0]
-                        face_cy = (fy + fh / 2) / CAMERA_RES[1]
-
-                        norm_x = (face_cx - 0.5) * 2.0
-                        norm_y = (face_cy - 0.5) * 2.0
-                        norm_x = -norm_x
-                        target_x_off = norm_x * MAX_X_OFFSET
-                        target_y_off = norm_y * MAX_Y_OFFSET
-                        target_x_off = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, target_x_off))
-                        target_y_off = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, target_y_off))
-
-                        dx = re_x - le_x
-                        dy = re_y - le_y
-                        if dx != 0:
-                            angle_rad = math.atan2(dy, dx)
-                            angle_deg = math.degrees(angle_rad)
-                            target_rotation = max(
-                                -FACE_ROLL_MAX_DEG,
-                                min(FACE_ROLL_MAX_DEG, -angle_deg * FACE_ROLL_MULT),
-                            )
-
-                        last_face_time = time.time()
-
-                        left_eye.set_emotion("idle",  0.45)
-                        right_eye.set_emotion("idle", 0.45)
-                        special_emotion = None
-                        search_emotion_active = False
-
-            except Exception as e:
-                print(f"Capture/Detect Error: {e}")
-
-        frame_skip_counter += 1
-        now = time.time()
-
-        # No-face idle behaviours: looking around + special emotions
-        if now - last_face_time > 0.8:
-            if now > next_search_time:
-                search_active_until = now + random.uniform(1.2, 2.2)
-                next_search_time    = now + random.uniform(6.0, 12.0)
-                search_style = "looking" if random.random() < 0.5 else "plain"
-
-            if now < search_active_until:
-                t = now * 2.2 + search_phase
-                target_x_off   = math.sin(t)       * (MAX_X_OFFSET * 0.75)
-                target_y_off   = math.sin(t * 1.2) * (MAX_Y_OFFSET * 0.22)
-                target_rotation = math.sin(t * 1.4) * 0.6
-                if special_emotion is None and search_style == "looking":
-                    search_emotion_active = True
-                    left_eye.set_emotion("looking",  intensity=0.45)
-                    right_eye.set_emotion("looking", intensity=0.45)
-            elif search_emotion_active and special_emotion is None:
-                search_emotion_active = False
-                left_eye.set_emotion("idle",  0.45)
-                right_eye.set_emotion("idle", 0.45)
-
-            if now > next_special_time and special_emotion is None:
-                special_active_until = now + random.uniform(1.2, 2.2)
-                special_emotion = random.choice(SPECIAL_EMOTIONS)
-                left_eye.set_emotion(special_emotion,  intensity=0.55)
-                right_eye.set_emotion(special_emotion, intensity=0.55)
-                for eye in (left_eye, right_eye):
-                    eye.blink_state = "IDLE"
-                    eye.vy = 0
-                next_special_time = now + random.uniform(12.0, 20.0)
-
-            if special_emotion and now > special_active_until:
-                special_emotion = None
-                left_eye.set_emotion("idle",  0.45)
-                right_eye.set_emotion("idle", 0.45)
+        with target_lock:
+            local_target_x = target_x_off
+            local_target_y = target_y_off
+            local_target_rot = target_rotation
+            local_target_squint = target_squint
 
         # Smooth tracking to reduce jitter
-        smooth_alpha      = 0.15
-        smoothed_x_off    += (target_x_off    - smoothed_x_off)    * smooth_alpha
-        smoothed_y_off    += (target_y_off    - smoothed_y_off)    * smooth_alpha
-        smoothed_rotation += (target_rotation - smoothed_rotation) * smooth_alpha
+        smooth_alpha = 0.15
+        smoothed_x_off = smoothed_x_off + (local_target_x - smoothed_x_off) * smooth_alpha
+        smoothed_y_off = smoothed_y_off + (local_target_y - smoothed_y_off) * smooth_alpha
+        smoothed_rotation = smoothed_rotation + (local_target_rot - smoothed_rotation) * smooth_alpha
+        
+        # 2. Update Eye Targets
+        left_eye.target_pos[0] = left_eye.base_x + smoothed_x_off
+        left_eye.target_pos[1] = left_eye.base_y + smoothed_y_off
+        clamp_eye_target(left_eye)
 
-        # Update Eye Targets
-        left_eye.target_pos[0]  = left_eye.base_x  + smoothed_x_off
-        left_eye.target_pos[1]  = left_eye.base_y  + smoothed_y_off
-        right_eye.target_pos[0] = right_eye.base_x + smoothed_x_off
-        right_eye.target_pos[1] = right_eye.base_y + smoothed_y_off
-        left_eye.target_rotation  = smoothed_rotation
+        right_eye.target_pos[0] = left_eye.target_pos[0]
+        right_eye.target_pos[1] = left_eye.target_pos[1]
+        left_eye.target_rotation = smoothed_rotation
         right_eye.target_rotation = smoothed_rotation
 
-        # Blink Logic
+        # Apply far-distance squint only when active.
+        should_squint = local_target_squint > 0.5
+        if should_squint != squint_active:
+            if should_squint:
+                left_eye.set_emotion("squint", 0.6)
+            else:
+                left_eye.set_emotion("idle", 0.45)
+            squint_active = should_squint
+        
+        # 3. Blink Logic
         if time.time() > next_blink_time:
             blink_speed = random.uniform(BLINK_SPEED_MIN, BLINK_SPEED_MAX)
-            for eye in (left_eye, right_eye):
-                eye.blink_state = "IDLE"
-                eye.vy = 0
-            left_eye.start_blink(blink_speed)
-            right_eye.start_blink(blink_speed)
+            trigger_synced_blink(blink_speed)
             last_blink_time = time.time()
             next_blink_time = time.time() + random.uniform(3.5, 7.0)
 
-        # Tiny idle wander when nothing detected
-        if target_x_off == 0 and target_y_off == 0:
-            if random.random() < 0.05:
-                left_eye.target_pos[0]  += random.uniform(-2, 2)
-                left_eye.target_pos[1]  += random.uniform(-2, 2)
-                right_eye.target_pos[0] += random.uniform(-2, 2)
-                right_eye.target_pos[1] += random.uniform(-2, 2)
-
-        # Physics Update
+        # Keep idle motion deterministic to avoid perceived micro-jitter.
+        
+        # 5. Physics Update
+        # Drive one master eye and mirror full state every frame for strict sync.
         left_eye.update()
-        right_eye.update()
+        mirror_full_state(left_eye, right_eye)
+        
+        # 6. Draw
+        shared_rgb = None
+        if disp_l or disp_r:
+            # Render once and present the exact same frame on both displays.
+            img = Image.new("RGBA", (SCREEN_WIDTH, SCREEN_HEIGHT), BG_COLOR)
+            left_eye.draw(img)
+            shared_rgb = img.convert("RGB")
 
-        # Render to displays
-        if disp_l:
-            img_l = Image.new("RGBA", (SCREEN_WIDTH, SCREEN_HEIGHT), BG_COLOR)
-            left_eye.draw(img_l)
-            disp_l.image(img_l.convert("RGB"))
+        try:
+            if disp_l and shared_rgb is not None:
+                disp_l.image(shared_rgb)
+            if disp_r and shared_rgb is not None:
+                disp_r.image(shared_rgb)
+        except Exception as e:
+            print(f"Display update error: {e}")
 
-        if disp_r:
-            img_r = Image.new("RGBA", (SCREEN_WIDTH, SCREEN_HEIGHT), BG_COLOR)
-            right_eye.draw(img_r)
-            disp_r.image(img_r.convert("RGB"))
+        frame_budget = (1.0 / max(1.0, float(RENDER_FPS))) - (time.perf_counter() - loop_start)
+        if frame_budget > 0:
+            time.sleep(frame_budget)
 
 except KeyboardInterrupt:
     print("\nStopping...")
 finally:
+    running = False
+    if vision_thread.is_alive():
+        vision_thread.join(timeout=1.0)
+
+    # Cleanup attributes
     try:
         if picam2:
             picam2.stop()
@@ -728,10 +845,9 @@ finally:
             print("MJPEG stream stopped.")
         except Exception as e:
             print(e)
-
+        
+    # Clear screens
     black = Image.new("RGB", (SCREEN_WIDTH, SCREEN_HEIGHT), (0, 0, 0))
-    if disp_l:
-        disp_l.image(black)
-    if disp_r:
-        disp_r.image(black)
+    if disp_l: disp_l.image(black)
+    if disp_r: disp_r.image(black)
     print("Displays cleared.")
