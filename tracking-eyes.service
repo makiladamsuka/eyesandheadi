@@ -1,0 +1,14 @@
+[Unit]
+Description=NEma Tracking Eyes
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/eyesandheadi
+ExecStart=/usr/bin/python3 /home/pi/eyesandheadi/tracking_eyes.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

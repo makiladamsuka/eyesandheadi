@@ -1,0 +1,6 @@
+# Install system packages first:
+# sudo apt install python3-picamera2 python3-opencv python3-pil python3-numpy
+
+# Then install these via pip3:
+adafruit-circuitpython-rgb-display
+adafruit-blinka
